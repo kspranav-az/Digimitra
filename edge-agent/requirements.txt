@@ -1,0 +1,15 @@
+opencv-python-headless==4.8.1.78
+ultralytics==8.0.196
+torch==2.1.0
+torchvision==0.16.0
+transformers==4.36.0
+sentence-transformers==2.2.2
+pymilvus==2.3.4
+minio==7.2.0
+kafka-python==2.0.2
+numpy==1.24.3
+pillow==10.1.0
+requests==2.31.0
+ffmpeg-python==0.2.0
+pydantic==2.5.0
+python-dotenv==1.0.0
