@@ -1,317 +1,155 @@
-"""
-FastAPI main application for AI surveillance system
-Blueprint reference: python_database integration
-"""
-import os
-import logging
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from database import get_db, create_tables, get_db_session
-from models import Camera, Event, VideoChunk, User
-from services import get_surveillance_services, SurveillanceServices
+from datetime import timedelta
+from typing import List
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from . import services, database, auth, schemas
+# Import the new AI Service and schema
+from .ai_service import AIService
+from .schemas import AIRequest
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """FastAPI lifespan context manager for service initialization and cleanup"""
-    # Startup
-    logger.info("Starting AI Surveillance System API...")
-    
-    # Initialize database tables
-    try:
-        create_tables()
-        logger.info("Database tables created/verified successfully")
-    except Exception as e:
-        logger.error(f"Failed to create database tables: {e}")
-        raise
-    
-    # Initialize surveillance services
-    from services import surveillance_services
-    global surveillance_services
-    try:
-        surveillance_services = SurveillanceServices()
-        logger.info("Surveillance services instance created")
-        
-        # Initialize all services
-        if surveillance_services.initialize_services():
-            logger.info("Surveillance services initialized successfully")
-            
-            # Start consumers if streaming is available
-            if surveillance_services.start_consumers():
-                logger.info("Kafka consumers started successfully")
-            else:
-                logger.warning("Kafka consumers could not be started (streaming service unavailable)")
-        else:
-            logger.warning("Some surveillance services failed to initialize")
-            
-        # Check readiness
-        if surveillance_services.is_ready():
-            logger.info("API is ready to handle requests")
-        else:
-            logger.warning("API is not fully ready - some services may be unavailable")
-            
-    except Exception as e:
-        logger.error(f"Failed to initialize surveillance services: {e}")
-        # Don't raise - allow app to start in degraded mode
-        surveillance_services = SurveillanceServices()  # Create basic instance
-    
-    logger.info("API startup complete")
-    
-    yield  # App runs here
-    
-    # Shutdown
-    logger.info("Shutting down AI Surveillance System API...")
-    try:
-        if surveillance_services:
-            surveillance_services.shutdown()
-            logger.info("Surveillance services shutdown complete")
-    except Exception as e:
-        logger.error(f"Error during service shutdown: {e}")
-    
-    logger.info("API shutdown complete")
+from shared.models import User, Event
+# Import the new Camera model and schema
+from shared.models import Camera as CameraModel
+from .schemas import Camera as CameraSchema, CameraCreate
 
-# Create FastAPI app with lifespan
-app = FastAPI(
-    title="AI Surveillance System API",
-    description="OOP-architected AI surveillance system with real-time processing",
-    version="1.0.0",
-    lifespan=lifespan
-)
+app = FastAPI()
 
-# Add CORS middleware for frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Instantiate the AI Service
+ai_service = AIService()
 
-
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "message": "AI Surveillance System API",
-        "status": "running",
-        "version": "1.0.0"
-    }
-
-@app.get("/health")
-async def health_check():
-    """Basic health check endpoint"""
-    try:
-        # Test database connection
-        db_status = "connected"
-        try:
-            with get_db_session() as db:
-                db.execute("SELECT 1")
-        except:
-            db_status = "disconnected"
-        
-        # Check if services are ready
-        services_ready = False
-        try:
-            services = get_surveillance_services()
-            services_ready = services.is_ready()
-        except:
-            pass
-        
-        return {
-            "status": "healthy" if db_status == "connected" else "degraded",
-            "database": db_status,
-            "services": {
-                "api": "running",
-                "database": db_status,
-                "surveillance_services": "ready" if services_ready else "not_ready"
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-
-@app.get("/api/v1/cameras")
-async def get_cameras(db: Session = Depends(get_db)):
-    """Get all cameras"""
-    try:
-        cameras = db.query(Camera).all()
-        return {
-            "cameras": [
-                {
-                    "camera_id": camera.camera_id,
-                    "name": camera.name,
-                    "location": camera.location,
-                    "latitude": camera.latitude,
-                    "longitude": camera.longitude,
-                    "status": camera.status,
-                    "is_active": camera.is_active
-                }
-                for camera in cameras
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/api/v1/events")
-async def get_events(
-    camera_id: str = None,
-    limit: int = 50,
-    db: Session = Depends(get_db)
-):
-    """Get events with optional camera filtering"""
-    try:
-        query = db.query(Event)
-        if camera_id:
-            query = query.filter(Event.camera_id == camera_id)
-        
-        events = query.limit(limit).all()
-        return {
-            "events": [
-                {
-                    "event_id": str(event.event_id),
-                    "camera_id": event.camera_id,
-                    "event_type": event.event_type,
-                    "confidence": event.confidence,
-                    "start_time": event.start_time.isoformat() if event.start_time else None,
-                    "severity": event.severity,
-                    "acknowledged": event.acknowledged
-                }
-                for event in events
-            ],
-            "total": len(events)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.post("/api/v1/cameras")
-async def create_camera(
-    camera_data: dict,
-    db: Session = Depends(get_db)
-):
-    """Create a new camera"""
-    try:
-        camera = Camera(
-            camera_id=camera_data.get("camera_id"),
-            name=camera_data.get("name"),
-            location=camera_data.get("location"),
-            latitude=camera_data.get("latitude"),
-            longitude=camera_data.get("longitude"),
-            region_id=camera_data.get("region_id"),
-            camera_type=camera_data.get("camera_type", "security")
-        )
-        db.add(camera)
+@app.on_event("startup")
+def startup_event():
+    db = next(database.get_db())
+    service_instance = services.SurveillanceServices(db)
+    service_instance.initialize_services()
+    # Create a default admin user if one doesn't exist
+    if not db.query(User).filter(User.username == "admin").first():
+        hashed_password = auth.get_password_hash("admin")
+        admin_user = User(username="admin", password=hashed_password, role="admin")
+        db.add(admin_user)
         db.commit()
-        db.refresh(camera)
-        
-        return {
-            "message": "Camera created successfully",
-            "camera_id": camera.camera_id
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        db.refresh(admin_user)
+    db.close()
 
-@app.post("/api/v1/search/similarity")
-async def search_similarity(request_data: dict):
-    """Search events by vector similarity"""
-    try:
-        query_embedding = request_data.get("embedding")
-        top_k = request_data.get("top_k", 10)
-        camera_filter = request_data.get("camera_id")
-        
-        if not query_embedding:
-            raise HTTPException(status_code=400, detail="embedding is required")
-        
-        services = get_surveillance_services()
-        results = services.search_events_by_similarity(
-            query_embedding=query_embedding,
-            top_k=top_k,
-            camera_filter=camera_filter
+# --- Auth Endpoints ---
+@app.post("/api/v1/token", response_model=schemas.Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not auth.verify_password(form_data.password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        
-        return {
-            "results": results,
-            "total": len(results)
-        }
-        
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail="Services not available")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(
+        data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
-@app.get("/api/v1/events/{event_id}/playback")
-async def get_event_playback(event_id: str):
-    """Get playback URLs for event"""
-    try:
-        services = get_surveillance_services()
-        urls = services.get_event_playback_urls(event_id)
-        
-        if not urls:
-            raise HTTPException(status_code=404, detail="Event not found")
-        
-        return urls
-        
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail="Services not available")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Playback error: {str(e)}")
+@app.post("/api/v1/users", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
+def create_user(
+    user: schemas.UserCreate,
+    db: Session = Depends(database.get_db),
+    current_user: User = Depends(auth.role_checker(["admin"]))
+):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    hashed_password = auth.get_password_hash(user.password)
+    db_user = User(username=user.username, password=hashed_password, role=user.role)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
-@app.get("/api/v1/cameras/{camera_id}/live")
-async def get_camera_live_feed(camera_id: str):
-    """Get live feed URL for camera"""
-    try:
-        services = get_surveillance_services()
-        feed_url = services.get_camera_live_feed_url(camera_id)
-        
-        if not feed_url:
-            raise HTTPException(status_code=404, detail="Camera not found or inactive")
-        
-        return {"live_feed_url": feed_url}
-        
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail="Services not available")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Live feed error: {str(e)}")
+# --- Camera Endpoints ---
+@app.post("/api/v1/cameras", response_model=CameraSchema, status_code=status.HTTP_201_CREATED)
+def create_camera(
+    camera: CameraCreate,
+    db: Session = Depends(database.get_db),
+    current_user: User = Depends(auth.role_checker(["admin"]))
+):
+    db_camera = CameraModel(**camera.dict())
+    db.add(db_camera)
+    db.commit()
+    db.refresh(db_camera)
+    return db_camera
 
-@app.get("/api/v1/health/services")
-async def health_check_services():
-    """Check health of all integrated services"""
-    try:
-        services = get_surveillance_services()
-        health_status = services.health_check()
-        
-        # Use overall_status from enhanced health check
-        status = health_status.get("overall_status", "unknown")
-        
-        return {
-            "status": status,
-            **health_status
-        }
-        
-    except RuntimeError as e:
-        # Services not initialized - return degraded status
-        return {
-            "status": "degraded",
-            "error": "Services not initialized",
-            "initialized": False,
-            "consumers_started": False,
-            "services": {
-                "storage": {"available": False, "error": "Not initialized"},
-                "streaming": {"available": False, "error": "Not initialized"},
-                "vector_db": {"available": False, "error": "Not initialized"}
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Health check error: {str(e)}")
+@app.put("/api/v1/cameras/{camera_id}", response_model=CameraSchema)
+def update_camera(
+    camera_id: str,
+    camera: CameraCreate, # Re-using the create schema for updates
+    db: Session = Depends(database.get_db),
+    current_user: User = Depends(auth.role_checker(["admin"]))
+):
+    db_camera = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
+    if not db_camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    for var, value in vars(camera).items():
+        setattr(db_camera, var, value) if value else None
+    db.commit()
+    db.refresh(db_camera)
+    return db_camera
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/api/v1/cameras", response_model=List[CameraSchema])
+def get_cameras(
+    db: Session = Depends(database.get_db),
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    return db.query(CameraModel).all()
+
+# --- Event & Search Endpoints ---
+@app.get("/api/v1/events")
+def get_events(
+    db: Session = Depends(database.get_db),
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    return db.query(Event).limit(100).all()
+
+@app.post("/api/v1/search/semantic")
+def search_semantic(
+    request: dict,
+    services: services.SurveillanceServices = Depends(services.get_surveillance_services),
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    query_embedding = request.get("embedding")
+    top_k = request.get("top_k", 10)
+    if not query_embedding:
+        raise HTTPException(status_code=400, detail="Embedding is required")
+    return services.search_events_by_similarity(query_embedding, top_k)
+
+@app.post("/api/v1/search/text")
+def search_text(
+    request: dict, # Expects {"query": "some text"}
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    # Placeholder for converting text to embedding and searching
+    # This will be implemented fully later
+    query = request.get("query")
+    if not query:
+        raise HTTPException(status_code=400, detail="Query text is required")
+    return {"message": f"Search results for '{query}' are not yet implemented.", "results": []}
+
+# --- AI Endpoints ---
+@app.post("/api/v1/ai/ask")
+def ask_ai(
+    request: AIRequest,
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    return ai_service.answer_question(request)
+
+
+# --- Live Feed ---
+@app.get("/api/v1/cameras/{camera_id}/live.m3u8")
+def get_live_feed(
+    camera_id: str,
+    services: services.SurveillanceServices = Depends(services.get_surveillance_services),
+    current_user: User = Depends(auth.get_current_active_user)
+):
+    live_feed_url = services.get_camera_live_feed_url(camera_id)
+    if not live_feed_url:
+        raise HTTPException(status_code=404, detail="Camera not found or live feed not available")
+    return {"url": live_feed_url}
